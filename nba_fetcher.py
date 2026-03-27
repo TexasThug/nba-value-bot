@@ -18,6 +18,7 @@ from nba_api.stats.static import teams as nba_teams_static
 CURRENT_SEASON = "2024-25"
 RECENT_GAMES   = 10          # nb de matchs pour calculer la "forme" d'une équipe
 API_DELAY      = 0.6         # secondes entre chaque appel (évite le rate-limit NBA)
+B2B_PENALTY    = 2.5         # points retirés du total prédit par équipe en back-to-back
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -105,13 +106,27 @@ def get_team_recent_form(team_id: int, n_games: int = RECENT_GAMES) -> dict:
         "total_avg":        round(df["PTS"].mean() + (df["PTS"] - df["PLUS_MINUS"]).mean(), 1),
         "home_pts_avg":     round(df[df["IS_HOME"]]["PTS"].mean(), 1) if df["IS_HOME"].any() else None,
         "away_pts_avg":     round(df[~df["IS_HOME"]]["PTS"].mean(), 1) if (~df["IS_HOME"]).any() else None,
+        "last_game_date":   df.iloc[0]["GAME_DATE"].strftime("%Y-%m-%d"),
     }
 
 
 # ── Prédiction du total d'un match ───────────────────────────────────────────
 
+def _is_back_to_back(last_game_date: str | None, game_date: str | None) -> bool:
+    """True si l'équipe a joué la veille du match ciblé."""
+    if not last_game_date or not game_date:
+        return False
+    from datetime import datetime
+    try:
+        delta = datetime.strptime(game_date, "%Y-%m-%d") - datetime.strptime(last_game_date, "%Y-%m-%d")
+        return delta.days == 1
+    except ValueError:
+        return False
+
+
 def predict_match_total(home_team_name: str, away_team_name: str,
-                         league_df: pd.DataFrame | None = None) -> dict:
+                         league_df: pd.DataFrame | None = None,
+                         game_date: str | None = None) -> dict:
     """
     Prédit le total de points attendu pour un match (home vs away).
 
@@ -142,52 +157,84 @@ def predict_match_total(home_team_name: str, away_team_name: str,
     print(f"[NBA] Forme récente : {away_team_name}...")
     away_form = get_team_recent_form(away_id)
 
-    # ── Calcul du total prédit ────────────────────────────────────────────────
-    # Méthode 1 : OFF_RATING + DEF_RATING (sur toute la saison, normalisé en points)
-    # OFF_RATING = points pour 100 possessions → on normalise avec le PACE
-    total_season = None
+    # ── Méthode 1 : stats saison (OFF/DEF_RATING × PACE) ─────────────────────
+    total_season  = None
+    spread_season = None
     if home_stats is not None and away_stats is not None:
-        # PACE = possessions par match (ex: 100)
-        # OFF_RATING = points marqués pour 100 possessions (ex: 119)
-        # Points marqués par équipe ≈ (OFF_RATING / 100) * PACE
         pace          = (home_stats.get("PACE", 98) + away_stats.get("PACE", 98)) / 2
         home_off_pts  = (home_stats.get("OFF_RATING", 110) / 100) * pace
         away_off_pts  = (away_stats.get("OFF_RATING", 110) / 100) * pace
         home_def_pts  = (home_stats.get("DEF_RATING", 110) / 100) * pace
         away_def_pts  = (away_stats.get("DEF_RATING", 110) / 100) * pace
 
-        # Points attendus de chaque équipe = moyenne OFF de l'attaque et DEF de l'adversaire
         home_pts_pred = (home_off_pts + away_def_pts) / 2
         away_pts_pred = (away_off_pts + home_def_pts) / 2
         total_season  = round(home_pts_pred + away_pts_pred, 1)
+        spread_season = round(home_pts_pred - away_pts_pred, 1)  # positif = home favori
 
-    # Méthode 2 : forme récente brute
-    # pts_for + pts_against = total du match côté domicile
-    # on fait la moyenne avec le total côté extérieur
-    total_recent = None
+    # ── Méthode 2 : forme récente ─────────────────────────────────────────────
+    # Total  : (pts_for + pts_against) pour chaque équipe, moyennés
+    # Spread : (plus_minus_home - plus_minus_away) / 2
+    #   → formule équivalente à (E[home_score] - E[away_score]) dans ce matchup
+    total_recent  = None
+    spread_recent = None
     if home_form and away_form:
         total_via_home = home_form["pts_for_avg"] + home_form["pts_against_avg"]
         total_via_away = away_form["pts_for_avg"] + away_form["pts_against_avg"]
         total_recent   = round((total_via_home + total_via_away) / 2, 1)
+        spread_recent  = round(
+            (home_form["plus_minus_avg"] - away_form["plus_minus_avg"]) / 2, 1
+        )
 
-    # Pondération finale : 60% saison, 40% forme récente
+    # ── Pondération finale : 60% saison, 40% forme récente ───────────────────
     if total_season and total_recent:
-        predicted_total = round(0.6 * total_season + 0.4 * total_recent, 1)
+        predicted_total  = round(0.6 * total_season  + 0.4 * total_recent,  1)
+        predicted_spread = round(0.6 * spread_season + 0.4 * spread_recent, 1)
     elif total_season:
-        predicted_total = total_season
+        predicted_total  = total_season
+        predicted_spread = spread_season
     elif total_recent:
-        predicted_total = total_recent
+        predicted_total  = total_recent
+        predicted_spread = spread_recent
     else:
-        predicted_total = None
+        predicted_total  = None
+        predicted_spread = None
+
+    # ── Ajustement back-to-back ────────────────────────────────────────────
+    b2b_home = _is_back_to_back(home_form.get("last_game_date"), game_date)
+    b2b_away = _is_back_to_back(away_form.get("last_game_date"), game_date)
+    b2b_adjustment = -B2B_PENALTY * (int(b2b_home) + int(b2b_away))
+
+    # Ajustement total : les deux équipes marquent moins en B2B
+    # Ajustement spread : home B2B → spread baisse ; away B2B → spread monte
+    b2b_spread_adj = -B2B_PENALTY * int(b2b_home) + B2B_PENALTY * int(b2b_away)
+
+    if b2b_adjustment != 0:
+        b2b_who = (("domicile" if b2b_home else "") +
+                   ("+" if b2b_home and b2b_away else "") +
+                   ("extérieur" if b2b_away else ""))
+        print(f"[NBA] Ajustement B2B ({b2b_who}) : total {b2b_adjustment:+.1f} pts | "
+              f"spread {b2b_spread_adj:+.1f} pts")
+        if predicted_total  is not None:
+            predicted_total  = round(predicted_total  + b2b_adjustment,   1)
+        if predicted_spread is not None:
+            predicted_spread = round(predicted_spread + b2b_spread_adj,   1)
 
     return {
-        "home_team":       home_team_name,
-        "away_team":       away_team_name,
-        "predicted_total": predicted_total,
-        "total_season":    total_season,
-        "total_recent":    total_recent,
-        "home_form":       home_form,
-        "away_form":       away_form,
+        "home_team":        home_team_name,
+        "away_team":        away_team_name,
+        "predicted_total":  predicted_total,
+        "predicted_spread": predicted_spread,   # positif = home favori (ex: +7.2)
+        "total_season":     total_season,
+        "spread_season":    spread_season,
+        "total_recent":     total_recent,
+        "spread_recent":    spread_recent,
+        "b2b_home":         b2b_home,
+        "b2b_away":         b2b_away,
+        "b2b_adjustment":   b2b_adjustment,
+        "b2b_spread_adj":   b2b_spread_adj,
+        "home_form":        home_form,
+        "away_form":        away_form,
     }
 
 

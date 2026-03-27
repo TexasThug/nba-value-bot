@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python backtester.py --fast)",
+      "Bash(python backtester.py)",
+      "Bash(python excel_tracker.py)",
+      "Bash(python -c \":*)",
+      "Bash(python value_bot.py --dry-run)",
+      "Bash(python check_results.py)",
+      "Bash(python -c \"import json; f=open\\(''value_bets_log.json''\\); line=json.loads\\(f.readline\\(\\)\\); print\\(line[''value_bets''][0][''date'']\\)\")",
+      "Bash(python -c \"import os; os.remove\\(''value_bets_results.json''\\)\")",
+      "Bash(python:*)"
+    ]
+  }
+}
