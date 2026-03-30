@@ -1,0 +1,104 @@
+=======================================================
+  NBA VALUE BOT - BACK-TESTER
+  Saisons : 2021-22, 2022-23, 2023-24
+  Mode    : COMPLET
+=======================================================
+
+=======================================================
+  BACK-TEST : 2021-22
+=======================================================
+  [NBA] Stats avancées 2021-22...
+  [NBA] Matchs 2021-22...
+  [NBA] 1230 matchs trouvés
+  [NBA] Chargement de tous les matchs de la saison...
+  [NBA] 2460 entrées chargées.
+  Analyse de 1230 matchs...
+
+
+  Résultats 2021-22 :
+  Matchs analysés : 1230
+  Paris placés    : 845 (68.7%)
+  Taux de victoire: 57.3%
+  P&L total       : +5414.85€
+  ROI             : 13.7%
+
+  -- Qualite modele --
+  TOTAUX  : RMSE=18.60  Biais=-2.3  R2=0.136  StdPred=5.5/StdAct=20.0
+  SPREADS : RMSE=13.93  Biais=-1.5  R2=0.171  StdPred=5.8/StdAct=15.3
+
+=======================================================
+  BACK-TEST : 2022-23
+=======================================================
+  [NBA] Stats avancées 2022-23...
+  [NBA] Matchs 2022-23...
+  [NBA] 1230 matchs trouvés
+  [NBA] Chargement de tous les matchs de la saison...
+  [NBA] 2460 entrées chargées.
+  Analyse de 1230 matchs...
+
+
+  Résultats 2022-23 :
+  Matchs analysés : 1229
+  Paris placés    : 825 (67.1%)
+  Taux de victoire: 58.7%
+  P&L total       : +6547.71€
+  ROI             : 18.5%
+
+  -- Qualite modele --
+  TOTAUX  : RMSE=18.48  Biais=-2.5  R2=0.073  StdPred=4.5/StdAct=19.2
+  SPREADS : RMSE=12.83  Biais=-2.4  R2=0.119  StdPred=4.9/StdAct=13.7
+
+=======================================================
+  BACK-TEST : 2023-24
+=======================================================
+  [NBA] Stats avancées 2023-24...
+  [NBA] Matchs 2023-24...
+  [NBA] 1230 matchs trouvés
+  [NBA] Chargement de tous les matchs de la saison...
+  [NBA] 2460 entrées chargées.
+  Analyse de 1230 matchs...
+
+
+  Résultats 2023-24 :
+  Matchs analysés : 1230
+  Paris placés    : 898 (73.0%)
+  Taux de victoire: 56.0%
+  P&L total       : +6078.13€
+  ROI             : 14.0%
+
+  -- Qualite modele --
+  TOTAUX  : RMSE=18.33  Biais=-2.2  R2=0.182  StdPred=6.2/StdAct=20.3
+  SPREADS : RMSE=13.92  Biais=-2.2  R2=0.208  StdPred=6.5/StdAct=15.6
+
+=======================================================
+  RÉSUMÉ GLOBAL (3 saisons)
+=======================================================
+  Total matchs    : 3689
+  Paris placés    : 2568
+  Taux victoire   : 57.3%
+  P&L total       : +18040.69€
+  ROI global      : 15.2%
+
+  ===================================================
+  DIAGNOSTIC MODELE — TOTAUX vs SPREADS
+  ===================================================
+                             TOTAUX      SPREADS
+  --------------------------------------------
+  RMSE (pts)                  18.47        13.57
+  Naive RMSE (pts)            20.15        14.89
+  R2                          0.160        0.170
+  StdDev predictions           6.50         5.77
+  StdDev actuals              20.15        14.89
+  Ratio pred/actual           0.323        0.388
+  Biais moyen (pts)           -2.33        -2.05
+
+  Biais spreads par tranche de spread reel :
+    [-40 a -15]  N= 389  RMSE=19.8  Biais=+18.5
+    [-15 a -8]  N= 474  RMSE=10.4  Biais=+8.8
+    [-8 a -3]  N= 498  RMSE=7.2  Biais=+4.7
+    [-3 a +3]  N= 432  RMSE=5.4  Biais=+0.5
+    [+3 a +8]  N= 542  RMSE=6.8  Biais=-4.3
+    [+8 a +15]  N= 665  RMSE=10.4  Biais=-9.0
+    [+15 a +40]  N= 642  RMSE=20.3  Biais=-18.9
+
+  Resultats sauvegardes dans backtest_results.json

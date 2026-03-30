@@ -13,6 +13,8 @@ Usage :
 import argparse
 import time
 import json
+import math
+import statistics
 import pandas as pd
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -37,21 +39,23 @@ SIMULATED_ODD  = 1.92
 
 @dataclass
 class BacktestResult:
-    season:          str
-    date:            str
-    home_team:       str
-    away_team:       str
-    predicted_total: float
-    actual_total:    float
-    line:            float        # ligne simulée = médiane de la saison
-    market:          str          # "Over" ou "Under"
-    model_prob:      float
-    bookie_prob:     float
-    value:           float
-    kelly_stake:     float
-    bet_placed:      bool         # True si value >= MIN_VALUE
-    won:             bool         # True si le pari aurait gagné
-    pnl:             float        # gain/perte en €
+    season:           str
+    date:             str
+    home_team:        str
+    away_team:        str
+    predicted_total:  float
+    actual_total:     float
+    predicted_spread: float       # marge prédite côté home (positif = home favori)
+    actual_spread:    float       # marge réelle (home_pts - away_pts = PLUS_MINUS)
+    line:             float       # ligne proxy rolling average
+    market:           str         # "Over" ou "Under"
+    model_prob:       float
+    bookie_prob:      float
+    value:            float
+    kelly_stake:      float
+    bet_placed:       bool
+    won:              bool
+    pnl:              float
 
 
 # ── Stats de ligue par saison ─────────────────────────────────────────────────
@@ -146,16 +150,16 @@ def is_b2b(team_id: int, game_date: pd.Timestamp, all_df: pd.DataFrame) -> bool:
     return not played.empty
 
 
-def predict_total(home_id: int, away_id: int,
+def predict_game(home_id: int, away_id: int,
                   league_df: pd.DataFrame,
                   game_date: pd.Timestamp,
-                  all_df: pd.DataFrame) -> float | None:
+                  all_df: pd.DataFrame) -> tuple[float, float] | None:
     """
-    Prédit le total d'un match : stats saison (60%) + forme récente (40%).
+    Prédit total ET spread d'un match.
+    Retourne (predicted_total, predicted_spread) ou None.
 
-    La forme est calculée sur les données AVANT game_date uniquement.
-    Plus de data leakage : chaque match est prédit avec les infos disponibles
-    à ce moment-là dans le temps.
+    Spread > 0 : home favori. Spread < 0 : away favori.
+    La forme est calculée AVANT game_date uniquement (no leakage).
     """
     home_stats = league_df[league_df["TEAM_ID"] == home_id]
     away_stats = league_df[league_df["TEAM_ID"] == away_id]
@@ -166,27 +170,40 @@ def predict_total(home_id: int, away_id: int,
     h = home_stats.iloc[0]
     a = away_stats.iloc[0]
 
-    # Méthode saison (stats cumulées — elles-mêmes légèrement leaky pour les
-    # premiers matchs, mais c'est une approximation acceptable)
-    pace          = (h.get("PACE", 98) + a.get("PACE", 98)) / 2
-    home_off_pts  = (h.get("OFF_RATING", 110) / 100) * pace
-    away_off_pts  = (a.get("OFF_RATING", 110) / 100) * pace
-    home_def_pts  = (h.get("DEF_RATING", 110) / 100) * pace
-    away_def_pts  = (a.get("DEF_RATING", 110) / 100) * pace
-    home_pts_pred = (home_off_pts + away_def_pts) / 2
-    away_pts_pred = (away_off_pts + home_def_pts) / 2
-    total_season  = home_pts_pred + away_pts_pred
+    # ── Méthode saison : formule multiplicative ───────────────────────────────
+    h_pace = h.get("PACE", 98)
+    a_pace = a.get("PACE", 98)
+    pace   = 2 * h_pace * a_pace / (h_pace + a_pace) if (h_pace + a_pace) > 0 else 98
 
-    # Forme récente — calculée sur les matchs AVANT ce match uniquement
+    h_off = h.get("OFF_RATING", 110)
+    a_off = a.get("OFF_RATING", 110)
+    h_def = h.get("DEF_RATING", 110)
+    a_def = a.get("DEF_RATING", 110)
+
+    league_avg_def = float(league_df["DEF_RATING"].mean()) if "DEF_RATING" in league_df.columns else 115.0
+
+    home_pts_pred  = h_off * (a_def / league_avg_def) * pace / 100
+    away_pts_pred  = a_off * (h_def / league_avg_def) * pace / 100
+    total_season   = home_pts_pred + away_pts_pred
+    spread_season  = home_pts_pred - away_pts_pred
+
+    # ── Méthode forme récente (no leakage) ───────────────────────────────────
     hf = form_at_date(home_id, game_date, all_df)
     af = form_at_date(away_id, game_date, all_df)
 
     if hf and af:
-        total_recent = ((hf["pts_for"] + hf["pts_against"]) +
-                        (af["pts_for"] + af["pts_against"])) / 2
-        return round(0.6 * total_season + 0.4 * total_recent, 1)
+        total_recent  = ((hf["pts_for"] + hf["pts_against"]) +
+                         (af["pts_for"] + af["pts_against"])) / 2
+        # Spread via forme : (plus_minus_home - plus_minus_away) / 2
+        h_pm          = hf["pts_for"] - hf["pts_against"]
+        a_pm          = af["pts_for"] - af["pts_against"]
+        spread_recent = (h_pm - a_pm) / 2
+        return (
+            round(0.6 * total_season  + 0.4 * total_recent,  1),
+            round(0.6 * spread_season + 0.4 * spread_recent, 1),
+        )
 
-    return round(total_season, 1)
+    return round(total_season, 1), round(spread_season, 1)
 
 
 def form_at_date(team_id: int, game_date: pd.Timestamp,
@@ -286,13 +303,23 @@ def backtest_season(season: str, fast: bool = False) -> list[BacktestResult]:
         away_id   = int(away_row.iloc[0]["TEAM_ID"])
         away_name = away_row.iloc[0]["TEAM_NAME"]
 
-        # Prédiction (avec ajustement back-to-back)
+        # Prédiction total + spread (avec ajustement back-to-back)
         b2b_home_flag = is_b2b(home_id, game["GAME_DATE"], all_df)
         b2b_away_flag = is_b2b(away_id, game["GAME_DATE"], all_df)
-        pred = predict_total(home_id, away_id, league_df, game["GAME_DATE"], all_df)
-        if pred is None:
+
+        result_pred = predict_game(home_id, away_id, league_df, game["GAME_DATE"], all_df)
+        if result_pred is None:
             continue
-        pred = round(pred - B2B_PENALTY * (int(b2b_home_flag) + int(b2b_away_flag)), 1)
+        pred, pred_spread = result_pred
+
+        # B2B total : les deux équipes marquent moins
+        pred        = round(pred - B2B_PENALTY * (int(b2b_home_flag) + int(b2b_away_flag)), 1)
+        # B2B spread : home B2B → spread baisse ; away B2B → spread monte
+        pred_spread = round(pred_spread
+                            - B2B_PENALTY * int(b2b_home_flag)
+                            + B2B_PENALTY * int(b2b_away_flag), 1)
+
+        actual_spread = int(game["PLUS_MINUS"])  # home_pts - away_pts
 
         # Ligne proxy : rolling average des totaux réels AVANT ce match
         # Indépendante du modèle → pas de biais circulaire (était random ±3 pts)
@@ -339,6 +366,8 @@ def backtest_season(season: str, fast: bool = False) -> list[BacktestResult]:
             away_team=away_name,
             predicted_total=pred,
             actual_total=round(actual_total, 1),
+            predicted_spread=pred_spread,
+            actual_spread=float(actual_spread),
             line=line,
             market=market,
             model_prob=model_prob,
@@ -350,9 +379,27 @@ def backtest_season(season: str, fast: bool = False) -> list[BacktestResult]:
             pnl=pnl,
         ))
 
-    bets    = [r for r in results if r.bet_placed]
-    wins    = [r for r in bets if r.won]
+    bets      = [r for r in results if r.bet_placed]
+    wins      = [r for r in bets if r.won]
     total_pnl = sum(r.pnl for r in bets)
+
+    # ── Métriques qualité modèle ──────────────────────────────────────────────
+    t_errors  = [r.predicted_total  - r.actual_total  for r in results]
+    s_errors  = [r.predicted_spread - r.actual_spread for r in results]
+    n         = len(results)
+
+    t_rmse    = math.sqrt(sum(e**2 for e in t_errors) / n)
+    s_rmse    = math.sqrt(sum(e**2 for e in s_errors) / n)
+    t_bias    = sum(t_errors) / n
+    s_bias    = sum(s_errors) / n
+
+    t_std_act = statistics.stdev([r.actual_total  for r in results])
+    s_std_act = statistics.stdev([r.actual_spread for r in results])
+    t_std_pred= statistics.stdev([r.predicted_total  for r in results])
+    s_std_pred= statistics.stdev([r.predicted_spread for r in results])
+
+    t_r2 = 1 - (t_rmse**2 / t_std_act**2)
+    s_r2 = 1 - (s_rmse**2 / s_std_act**2)
 
     print(f"\n  Résultats {season} :")
     print(f"  Matchs analysés : {len(results)}")
@@ -360,6 +407,11 @@ def backtest_season(season: str, fast: bool = False) -> list[BacktestResult]:
     print(f"  Taux de victoire: {len(wins)/max(len(bets),1)*100:.1f}%")
     print(f"  P&L total       : {total_pnl:+.2f}€")
     print(f"  ROI             : {total_pnl/max(sum(r.kelly_stake for r in bets),1)*100:.1f}%")
+    print(f"\n  -- Qualite modele --")
+    print(f"  TOTAUX  : RMSE={t_rmse:.2f}  Biais={t_bias:+.1f}  R2={t_r2:.3f}  "
+          f"StdPred={t_std_pred:.1f}/StdAct={t_std_act:.1f}")
+    print(f"  SPREADS : RMSE={s_rmse:.2f}  Biais={s_bias:+.1f}  R2={s_r2:.3f}  "
+          f"StdPred={s_std_pred:.1f}/StdAct={s_std_act:.1f}")
 
     return results
 
@@ -406,8 +458,48 @@ def main():
     print(f"  Taux victoire   : {len(wins)/max(len(bets),1)*100:.1f}%")
     print(f"  P&L total       : {pnl:+.2f}€")
     print(f"  ROI global      : {pnl/max(invested,1)*100:.1f}%")
-    print(f"\n  Résultats sauvegardés dans backtest_results.json")
-    print(f"  Lance excel_tracker.py pour générer le fichier Excel !")
+
+    # ── Diagnostic comparatif totaux vs spreads ───────────────────────────────
+    if all_results:
+        n = len(all_results)
+        t_err = [r.predicted_total  - r.actual_total  for r in all_results]
+        s_err = [r.predicted_spread - r.actual_spread for r in all_results]
+
+        t_rmse = math.sqrt(sum(e**2 for e in t_err) / n)
+        s_rmse = math.sqrt(sum(e**2 for e in s_err) / n)
+
+        t_std_act  = statistics.stdev([r.actual_total  for r in all_results])
+        s_std_act  = statistics.stdev([r.actual_spread for r in all_results])
+        t_std_pred = statistics.stdev([r.predicted_total  for r in all_results])
+        s_std_pred = statistics.stdev([r.predicted_spread for r in all_results])
+
+        t_r2 = 1 - (t_rmse**2 / t_std_act**2)
+        s_r2 = 1 - (s_rmse**2 / s_std_act**2)
+
+        print(f"\n  {'='*51}")
+        print(f"  DIAGNOSTIC MODELE — TOTAUX vs SPREADS")
+        print(f"  {'='*51}")
+        print(f"  {'':20} {'TOTAUX':>12} {'SPREADS':>12}")
+        print(f"  {'-'*44}")
+        print(f"  {'RMSE (pts)':20} {t_rmse:>12.2f} {s_rmse:>12.2f}")
+        print(f"  {'Naive RMSE (pts)':20} {t_std_act:>12.2f} {s_std_act:>12.2f}")
+        print(f"  {'R2':20} {t_r2:>12.3f} {s_r2:>12.3f}")
+        print(f"  {'StdDev predictions':20} {t_std_pred:>12.2f} {s_std_pred:>12.2f}")
+        print(f"  {'StdDev actuals':20} {t_std_act:>12.2f} {s_std_act:>12.2f}")
+        print(f"  {'Ratio pred/actual':20} {t_std_pred/t_std_act:>12.3f} {s_std_pred/s_std_act:>12.3f}")
+        print(f"  {'Biais moyen (pts)':20} {sum(t_err)/n:>+12.2f} {sum(s_err)/n:>+12.2f}")
+        print(f"\n  Biais spreads par tranche de spread reel :")
+        for lo, hi in [(-40,-15),(-15,-8),(-8,-3),(-3,3),(3,8),(8,15),(15,40)]:
+            sub = [(r.predicted_spread, r.actual_spread)
+                   for r in all_results if lo <= r.actual_spread < hi]
+            if len(sub) < 5:
+                continue
+            errs  = [p - a for p, a in sub]
+            bias  = sum(errs) / len(errs)
+            rmse_ = math.sqrt(sum(e**2 for e in errs) / len(errs))
+            print(f"    [{lo:+d} a {hi:+d}]  N={len(sub):4d}  RMSE={rmse_:.1f}  Biais={bias:+.1f}")
+
+    print(f"\n  Resultats sauvegardes dans backtest_results.json")
 
 
 if __name__ == "__main__":

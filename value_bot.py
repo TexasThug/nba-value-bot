@@ -27,10 +27,15 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",  "REMPLACE_PAR_TON_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID","REMPLACE_PAR_TON_CHAT_ID")
 
 # Seuils de détection
-MIN_VALUE        = 0.04   # valeur minimum pour alerter (4%)
+# MIN_VALUE = 0.04 était trop bas : avec std_dev=18.9, 2 pts suffisaient à
+# déclencher 4% de value — le modèle n'a pas ce niveau de précision.
+# À 8%, il faut ~5 pts d'écart, ce qui est plus exigeant et filtre mieux.
+# Recalibrer après 500+ vrais résultats.
+MIN_VALUE        = 0.08   # valeur minimum pour alerter (8%)
 MIN_BOOKMAKERS   = 1      # ignorer les matchs couverts par peu de bookies
-KELLY_FRACTION   = 0.25   # Kelly fractionné (25% du Kelly pur = plus prudent)
-BANKROLL         = 1000   # Bankroll fictive en € pour calculer la mise Kelly
+KELLY_FRACTION   = 0.25   # Kelly fractionné — conservé pour référence uniquement
+BANKROLL         = 1000   # Bankroll fictive de test
+FIXED_STAKE      = 10.0   # Mise fixe par bet (phase de test 2 semaines)
 
 # Modèle de distribution des totaux NBA
 # RMSE calibré sur 3689 matchs historiques (2021-24) : 18.87 pts
@@ -39,7 +44,7 @@ STD_DEV = 18.9
 # Modèle de distribution des spreads NBA
 # RMSE estimé ~12 pts (à recalibrer après 200+ bets réels)
 # Var(spread_error) ≈ Var(home_error) + Var(away_error) - 2·Cov → ~12 pts
-STD_DEV_SPREAD = 12.0
+STD_DEV_SPREAD = 13.6   # calibré sur backtest 3 saisons (RMSE spreads = 13.57)
 
 # Mapping noms d'équipes The Odds API → nba_api (quand ils diffèrent)
 TEAM_NAME_MAP = {
@@ -195,15 +200,13 @@ def detect_spread_bets(spreads: list[dict], league_df) -> list[SpreadBet]:
         # Value Home cover
         value_home = round((prob_home * best_home["price"]) - 1, 4)
         if value_home >= MIN_VALUE:
-            kelly = fractional_kelly(prob_home, best_home["price"])
-            stake = round(BANKROLL * kelly, 2)
             side  = f"Home {line:+g}"
-            print(f"  [VALUE BET] {side} : value={value_home:.1%} | cote={best_home['price']} | mise: {stake}€")
+            print(f"  [VALUE BET] {side} : value={value_home:.1%} | cote={best_home['price']} | mise: {FIXED_STAKE}€")
             spread_bets.append(SpreadBet(
                 home_team=home, away_team=away, date=match["date"],
                 side=side, bookmaker=best_home["bookmaker"],
                 bookie_odd=best_home["price"], bookie_prob=bookie_prob_home,
-                model_prob=prob_home, value=value_home, kelly_stake=stake,
+                model_prob=prob_home, value=value_home, kelly_stake=FIXED_STAKE,
                 predicted_spread=pred_spread, spread_line=line,
                 b2b_home=b2b_home, b2b_away=b2b_away,
             ))
@@ -211,15 +214,13 @@ def detect_spread_bets(spreads: list[dict], league_df) -> list[SpreadBet]:
         # Value Away cover
         value_away = round((prob_away * best_away["price"]) - 1, 4)
         if value_away >= MIN_VALUE:
-            kelly = fractional_kelly(prob_away, best_away["price"])
-            stake = round(BANKROLL * kelly, 2)
             side  = f"Away {-line:+g}"
-            print(f"  [VALUE BET] {side} : value={value_away:.1%} | cote={best_away['price']} | mise: {stake}€")
+            print(f"  [VALUE BET] {side} : value={value_away:.1%} | cote={best_away['price']} | mise: {FIXED_STAKE}€")
             spread_bets.append(SpreadBet(
                 home_team=home, away_team=away, date=match["date"],
                 side=side, bookmaker=best_away["bookmaker"],
                 bookie_odd=best_away["price"], bookie_prob=bookie_prob_away,
-                model_prob=prob_away, value=value_away, kelly_stake=stake,
+                model_prob=prob_away, value=value_away, kelly_stake=FIXED_STAKE,
                 predicted_spread=pred_spread, spread_line=line,
                 b2b_home=b2b_home, b2b_away=b2b_away,
             ))
@@ -293,14 +294,12 @@ def detect_value_bets(totals: list[dict], league_df) -> list[ValueBet]:
         value_over = round((prob_over * best_over["price"]) - 1, 4)
 
         if value_over >= MIN_VALUE:
-            kelly = fractional_kelly(prob_over, best_over["price"])
-            stake = round(BANKROLL * kelly, 2)
-            print(f"  [VALUE BET OVER]  : value={value_over:.1%} | cote={best_over['price']} @ {best_over['bookmaker']} | mise conseillée : {stake}€")
+            print(f"  [VALUE BET OVER]  : value={value_over:.1%} | cote={best_over['price']} @ {best_over['bookmaker']} | mise : {FIXED_STAKE}€")
             value_bets.append(ValueBet(
                 home_team=home, away_team=away, date=match["date"],
                 market=f"Over {line}", bookmaker=best_over["bookmaker"],
                 bookie_odd=best_over["price"], bookie_prob=bookie_prob_over,
-                model_prob=prob_over, value=value_over, kelly_stake=stake,
+                model_prob=prob_over, value=value_over, kelly_stake=FIXED_STAKE,
                 predicted_total=pred_total, total_line=line,
                 b2b_home=b2b_home, b2b_away=b2b_away,
             ))
@@ -308,14 +307,12 @@ def detect_value_bets(totals: list[dict], league_df) -> list[ValueBet]:
         value_under = round((prob_under * best_under["price"]) - 1, 4)
 
         if value_under >= MIN_VALUE:
-            kelly = fractional_kelly(prob_under, best_under["price"])
-            stake = round(BANKROLL * kelly, 2)
-            print(f"  [VALUE BET UNDER] : value={value_under:.1%} | cote={best_under['price']} @ {best_under['bookmaker']} | mise conseillée : {stake}€")
+            print(f"  [VALUE BET UNDER] : value={value_under:.1%} | cote={best_under['price']} @ {best_under['bookmaker']} | mise : {FIXED_STAKE}€")
             value_bets.append(ValueBet(
                 home_team=home, away_team=away, date=match["date"],
                 market=f"Under {line}", bookmaker=best_under["bookmaker"],
                 bookie_odd=best_under["price"], bookie_prob=bookie_prob_under,
-                model_prob=prob_under, value=value_under, kelly_stake=stake,
+                model_prob=prob_under, value=value_under, kelly_stake=FIXED_STAKE,
                 predicted_total=pred_total, total_line=line,
                 b2b_home=b2b_home, b2b_away=b2b_away,
             ))
@@ -381,8 +378,7 @@ def format_spread_bet_message(sb: SpreadBet) -> str:
         f"\n"
         f" <b>Value : {value_pct}</b>\n"
         f"  Cote : {sb.bookie_odd} @ {sb.bookmaker}\n"
-        f"  Mise Kelly ({int(KELLY_FRACTION*100)}%) : <b>{sb.kelly_stake}€</b>\n"
-        f"  (sur bankroll de {BANKROLL}€)"
+        f"  Mise fixe : <b>{sb.kelly_stake}€</b> (bankroll {BANKROLL}€)"
     )
 
 
@@ -412,8 +408,7 @@ def format_value_bet_message(vb: ValueBet) -> str:
         f"\n"
         f" <b>Value : {value_pct}</b>\n"
         f"  Cote : {vb.bookie_odd} @ {vb.bookmaker}\n"
-        f"  Mise Kelly ({int(KELLY_FRACTION*100)}%) : <b>{vb.kelly_stake}€</b>\n"
-        f"  (sur bankroll de {BANKROLL}€)"
+        f"  Mise fixe : <b>{vb.kelly_stake}€</b> (bankroll {BANKROLL}€)"
     )
 
 

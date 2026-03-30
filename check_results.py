@@ -16,22 +16,34 @@ from datetime import datetime, timedelta
 
 from nba_api.stats.endpoints import leaguegamefinder
 
-LOG_FILE     = "value_bets_log.json"
-RESULTS_FILE = "value_bets_results.json"
-API_DELAY    = 0.7
+LOG_FILE          = "value_bets_log.json"
+RESULTS_FILE      = "value_bets_results.json"   # combined (source de vérité)
+RESULTS_TOTAUX    = "results_totaux.json"
+RESULTS_SPREADS   = "results_spreads.json"
+API_DELAY         = 0.7
 
 
 # ── Charger le log des bets ───────────────────────────────────────────────────
 
 def load_bets() -> list[dict]:
+    """
+    Charge toutes les bets (spreads + totaux) du log.
+    Chaque bet reçoit un champ 'bet_type' : 'spread' ou 'total'.
+    """
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip()]
         bets = []
         for line in lines:
             entry = json.loads(line)
+            ts = entry["timestamp"]
+            for sb in entry.get("spread_bets", []):
+                sb["logged_at"] = ts
+                sb["bet_type"]  = "spread"
+                bets.append(sb)
             for vb in entry.get("value_bets", []):
-                vb["logged_at"] = entry["timestamp"]
+                vb["logged_at"] = ts
+                vb["bet_type"]  = "total"
                 bets.append(vb)
         return bets
     except FileNotFoundError:
@@ -128,29 +140,50 @@ def find_score(bet: dict, scores: list[dict]) -> dict | None:
 # ── Calculer Won / Lost ───────────────────────────────────────────────────────
 
 def resolve_bet(bet: dict, score: dict) -> dict:
-    """Determine si la bet est gagnee ou perdue."""
-    line   = bet["total_line"]
-    market = bet["market"]      # "Over 224.5" ou "Under 224.5"
-    total  = score["total"]
-
-    if market.startswith("Over"):
-        won = total > line
-    else:
-        won = total < line
-
+    """Determine si la bet est gagnee ou perdue (supporte spreads et totaux)."""
+    actual_total  = score["total"]
+    actual_spread = score["home_pts"] - score["away_pts"]  # marge home
     stake = bet["kelly_stake"]
     odd   = bet["bookie_odd"]
-    pnl   = round(stake * (odd - 1) if won else -stake, 2)
 
-    return {
-        **bet,
-        "actual_total": total,
-        "home_pts":     score["home_pts"],
-        "away_pts":     score["away_pts"],
-        "won":          won,
-        "pnl":          pnl,
-        "resolved_at":  datetime.now().isoformat(),
-    }
+    if bet.get("bet_type") == "spread":
+        # Spread bet : "Home -7.5" ou "Away +7.5"
+        side        = bet["side"]   # ex: "Home -7.5"
+        spread_line = bet["spread_line"]
+
+        if side.startswith("Home"):
+            # Home couvre si actual_spread > -spread_line
+            won = actual_spread > -spread_line
+        else:
+            # Away couvre si actual_spread < -spread_line
+            won = actual_spread < -spread_line
+
+        pnl = round(stake * (odd - 1) if won else -stake, 2)
+        return {
+            **bet,
+            "actual_spread": actual_spread,
+            "actual_total":  actual_total,
+            "home_pts":      score["home_pts"],
+            "away_pts":      score["away_pts"],
+            "won":           won,
+            "pnl":           pnl,
+            "resolved_at":   datetime.now().isoformat(),
+        }
+    else:
+        # Total bet : "Over 224.5" ou "Under 224.5"
+        line   = bet["total_line"]
+        market = bet["market"]
+        won    = actual_total > line if market.startswith("Over") else actual_total < line
+        pnl    = round(stake * (odd - 1) if won else -stake, 2)
+        return {
+            **bet,
+            "actual_total": actual_total,
+            "home_pts":     score["home_pts"],
+            "away_pts":     score["away_pts"],
+            "won":          won,
+            "pnl":          pnl,
+            "resolved_at":  datetime.now().isoformat(),
+        }
 
 
 # ── Affichage des resultats ───────────────────────────────────────────────────
@@ -171,7 +204,11 @@ def print_summary(resolved: list[dict]):
     for r in resolved:
         status = "WON  " if r["won"] else "LOST "
         print(f"\n  [{status}] {r['away_team']} @ {r['home_team']}")
-        print(f"    {r['market']} | Ligne: {r['total_line']} | Score reel: {r['actual_total']} ({r['home_pts']}-{r['away_pts']})")
+        if r.get("bet_type") == "spread":
+            margin = r.get("actual_spread", "?")
+            print(f"    {r['side']} | Marge reelle: {margin:+g} pts ({r['home_pts']}-{r['away_pts']})")
+        else:
+            print(f"    {r['market']} | Ligne: {r['total_line']} | Total: {r['actual_total']} ({r['home_pts']}-{r['away_pts']})")
         print(f"    Mise: {r['kelly_stake']}e | P&L: {r['pnl']:+.2f}e")
 
     print(f"\n{'-'*55}")
@@ -238,7 +275,7 @@ def main():
 
     for bet in bets:
         # Cle unique pour eviter les doublons
-        key = f"{bet['date'][:10]}|{bet['home_team']}|{bet['market']}"
+        key = f"{bet['date'][:10]}|{bet['home_team']}|{bet.get('market') or bet.get('side', '')}"
 
         if key in known_results:
             continue  # deja resolue
@@ -273,15 +310,36 @@ def main():
     if still_pending:
         print(f"  {len(still_pending)} bet(s) en attente (matchs pas encore joues ?)")
 
-    # Afficher le cumul global de tous les resultats connus
+    # Sauvegarder les résultats séparés par type
     all_resolved = list(known_results.values())
-    if all_resolved and len(all_resolved) > len(newly_resolved):
-        total_pnl    = sum(r["pnl"] for r in all_resolved)
-        total_invest = sum(r["kelly_stake"] for r in all_resolved)
-        total_wins   = sum(1 for r in all_resolved if r["won"])
-        print(f"\n  Cumul global ({len(all_resolved)} bets) :")
-        print(f"  Win rate : {total_wins}/{len(all_resolved)} ({total_wins/len(all_resolved)*100:.0f}%)")
-        print(f"  P&L total: {total_pnl:+.2f}e | ROI: {total_pnl/max(total_invest,1)*100:.1f}%")
+    totaux_resolved  = [r for r in all_resolved if r.get("bet_type") == "total"]
+    spreads_resolved = [r for r in all_resolved if r.get("bet_type") == "spread"]
+    with open(RESULTS_TOTAUX,  "w", encoding="utf-8") as f:
+        json.dump(totaux_resolved,  f, ensure_ascii=False, indent=2)
+    with open(RESULTS_SPREADS, "w", encoding="utf-8") as f:
+        json.dump(spreads_resolved, f, ensure_ascii=False, indent=2)
+
+    # Afficher le cumul global par type
+    def _summary_line(label, results):
+        if not results:
+            return f"  {label:8s}: 0 bets"
+        wins   = sum(1 for r in results if r["won"])
+        pnl    = sum(r["pnl"] for r in results)
+        invest = sum(r["kelly_stake"] for r in results)
+        roi    = pnl / max(invest, 1) * 100
+        return (f"  {label:8s}: {len(results)} bets | "
+                f"Win {wins}/{len(results)} ({wins/len(results)*100:.0f}%) | "
+                f"P&L {pnl:+.2f}e | ROI {roi:.1f}%")
+
+    if all_resolved:
+        print(f"\n  {'='*53}")
+        print(f"  CUMUL GLOBAL ({len(all_resolved)} bets resolues)")
+        print(f"  {'-'*53}")
+        print(_summary_line("TOTAUX",  totaux_resolved))
+        print(_summary_line("SPREADS", spreads_resolved))
+        print(f"  {'-'*53}")
+        print(_summary_line("TOTAL",   all_resolved))
+        print(f"  {'='*53}")
 
 
 if __name__ == "__main__":

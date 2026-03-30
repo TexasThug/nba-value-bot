@@ -157,20 +157,41 @@ def predict_match_total(home_team_name: str, away_team_name: str,
     print(f"[NBA] Forme récente : {away_team_name}...")
     away_form = get_team_recent_form(away_id)
 
-    # ── Méthode 1 : stats saison (OFF/DEF_RATING × PACE) ─────────────────────
+    # ── Méthode 1 : stats saison — formule multiplicative ────────────────────
+    #
+    # Ancienne formule (additive) : (home_OFF + away_DEF) / 2
+    #   → régresse vers la moyenne, std dev prédictions = 4.7 pts (actuals = 20 pts)
+    #
+    # Nouvelle formule (multiplicative) :
+    #   E[home_score] = home_OFF × (away_DEF / league_avg_DEF) × pace / 100
+    #   Standard en NBA analytics. Préserve les interactions extrêmes :
+    #   bonne attaque × mauvaise défense → score élevé (pas juste leur moyenne).
+    #
+    # Pace : moyenne harmonique plutôt qu'arithmétique.
+    #   Une équipe lente contraint plus le tempo qu'une équipe rapide ne peut
+    #   l'accélérer. La moyenne harmonique est plus proche du pace réel observé.
+    #
     total_season  = None
     spread_season = None
     if home_stats is not None and away_stats is not None:
-        pace          = (home_stats.get("PACE", 98) + away_stats.get("PACE", 98)) / 2
-        home_off_pts  = (home_stats.get("OFF_RATING", 110) / 100) * pace
-        away_off_pts  = (away_stats.get("OFF_RATING", 110) / 100) * pace
-        home_def_pts  = (home_stats.get("DEF_RATING", 110) / 100) * pace
-        away_def_pts  = (away_stats.get("DEF_RATING", 110) / 100) * pace
+        h_pace = home_stats.get("PACE", 98)
+        a_pace = away_stats.get("PACE", 98)
+        # Moyenne harmonique du pace (favorise le tempo lent)
+        pace = 2 * h_pace * a_pace / (h_pace + a_pace) if (h_pace + a_pace) > 0 else 98
 
-        home_pts_pred = (home_off_pts + away_def_pts) / 2
-        away_pts_pred = (away_off_pts + home_def_pts) / 2
+        h_off = home_stats.get("OFF_RATING", 110)
+        a_off = away_stats.get("OFF_RATING", 110)
+        h_def = home_stats.get("DEF_RATING", 110)
+        a_def = away_stats.get("DEF_RATING", 110)
+
+        # Moyenne ligue : base de normalisation pour l'ajustement défensif
+        league_avg_def = float(league_df["DEF_RATING"].mean()) if "DEF_RATING" in league_df.columns else 115.0
+
+        # Score prédit : OFF de l'attaquant × ajustement défensif de l'adversaire
+        home_pts_pred = h_off * (a_def / league_avg_def) * pace / 100
+        away_pts_pred = a_off * (h_def / league_avg_def) * pace / 100
         total_season  = round(home_pts_pred + away_pts_pred, 1)
-        spread_season = round(home_pts_pred - away_pts_pred, 1)  # positif = home favori
+        spread_season = round(home_pts_pred - away_pts_pred, 1)
 
     # ── Méthode 2 : forme récente ─────────────────────────────────────────────
     # Total  : (pts_for + pts_against) pour chaque équipe, moyennés
